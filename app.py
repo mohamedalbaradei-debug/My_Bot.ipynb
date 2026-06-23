@@ -146,6 +146,23 @@ def get_us10y_yield_sentiment(us10y_yield):
 def get_news_summary_placeholder():
     return "• News unavailable due to website scraping restrictions (403 Forbidden). Consider using a dedicated news API for reliable data."
 
+def get_fear_greed_index_alternative():
+    """Fetch Fear & Greed Index from alternative.me API (more reliable)."""
+    url = "https://api.alternative.me/fng/?limit=1"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data['data']:
+            index_value = data['data'][0]['value']
+            index_classification = data['data'][0]['value_classification']
+            timestamp = data['data'][0]['time_until_update']
+            return f"{index_classification} ({index_value}/100)"
+        else:
+            return "N/A (No data available)"
+    except Exception as e:
+        return f"N/A (Error: {str(e)})"
+
 def get_fear_greed_index_placeholder():
     url = "https://feargreedmeter.com/fear-and-greed-index"
     headers = {
@@ -259,7 +276,9 @@ if search_button and ticker_input:
             st.error("❌ Could not retrieve data. Check ticker symbol.")
         else:
             vix, us10y_yield, macro_note, cycle_note = get_macro_and_market_cycle()
-            fear_greed_index_value = get_fear_greed_index_placeholder()
+            
+            # Use alternative.me API for Fear & Greed Index (more reliable)
+            fear_greed_index_value = get_fear_greed_index_alternative()
             news_summary = get_news_summary_placeholder()
 
             # Fetch Bitcoin, Oil, Gold
@@ -357,7 +376,7 @@ if search_button and ticker_input:
             st.write(f"**Bitcoin:** ${f'{bitcoin_price:,.2f}' if isinstance(bitcoin_price, (int, float)) else bitcoin_price}")
             st.write(f"**Crude Oil:** ${f'{crude_oil_price:,.2f}' if isinstance(crude_oil_price, (int, float)) else crude_oil_price}")
             st.write(f"**Gold:** ${f'{gold_price:,.2f}' if isinstance(gold_price, (int, float)) else gold_price}")
-            st.write(f"**Fear & Greed Index:** {fear_greed_index_value}")
+            st.write(f"**Fear & Greed Index (alternative.me):** {fear_greed_index_value}")
 
             st.divider()
 
