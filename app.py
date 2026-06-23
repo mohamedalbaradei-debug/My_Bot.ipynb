@@ -1,12 +1,17 @@
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 from datetime import datetime, timedelta
 import warnings
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 import plotly.graph_objects as go
+
+# Import pandas_ta with error handling
+try:
+    import pandas_ta as ta
+except ImportError:
+    ta = None
 
 warnings.filterwarnings("ignore")
 
@@ -59,17 +64,23 @@ def get_asset_data(ticker):
         if df.empty:
             return None, None, None, None
 
-        # Technical indicators
-        if len(df) >= 200:
-            df.ta.rsi(length=14, append=True)
-            df.ta.macd(append=True)
-            df.ta.sma(length=50, append=True)
-            df.ta.sma(length=200, append=True)
-        else:
-            if len(df) >= 14:
+        # Technical indicators using pandas_ta if available
+        if ta is not None and len(df) >= 200:
+            try:
                 df.ta.rsi(length=14, append=True)
-            if len(df) >= 50:
+                df.ta.macd(append=True)
                 df.ta.sma(length=50, append=True)
+                df.ta.sma(length=200, append=True)
+            except:
+                # Fallback: calculate manually if pandas_ta fails
+                df['SMA_50'] = df['Close'].rolling(window=50).mean()
+                df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        else:
+            # Manual calculation fallback
+            if len(df) >= 50:
+                df['SMA_50'] = df['Close'].rolling(window=50).mean()
+            if len(df) >= 200:
+                df['SMA_200'] = df['Close'].rolling(window=200).mean()
 
         # Support / Resistance
         recent = df.tail(60)
@@ -92,11 +103,27 @@ def get_asset_data(ticker):
                 elif latest['SMA_50'] < latest['SMA_200']:
                     ma_cross_status = "SMA50 < SMA200 (Bearish Trend)"
 
+        # RSI calculation (fallback manual)
+        rsi_value = latest.get('RSI_14', 'N/A')
+        if rsi_value == 'N/A' and len(df) >= 14:
+            try:
+                delta = df['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi_value = 100 - (100 / (1 + rs.iloc[-1]))
+            except:
+                rsi_value = 'N/A'
+
+        # MACD calculation (simplified fallback)
+        macd_value = latest.get('MACD_12_26_9', 'N/A')
+        macd_signal_value = latest.get('MACDs_12_26_9', 'N/A')
+
         analysis = {
             "current_price": latest['Close'],
-            "rsi": latest.get('RSI_14', 'N/A'),
-            "macd": latest.get('MACD_12_26_9', 'N/A'),
-            "macd_signal": latest.get('MACDs_12_26_9', 'N/A'),
+            "rsi": rsi_value,
+            "macd": macd_value,
+            "macd_signal": macd_signal_value,
             "sma50": latest.get('SMA_50', 'N/A'),
             "sma200": latest.get('SMA_200', 'N/A'),
             "support": support,
@@ -156,7 +183,6 @@ def get_fear_greed_index_alternative():
         if data['data']:
             index_value = data['data'][0]['value']
             index_classification = data['data'][0]['value_classification']
-            timestamp = data['data'][0]['time_until_update']
             return f"{index_classification} ({index_value}/100)"
         else:
             return "N/A (No data available)"
@@ -245,9 +271,6 @@ def get_recommendations(price, rsi, macd, macd_signal, sma50, sma200, info, ma_c
             trader_rec["action"] = "Consider Sell/Short (Overbought)"
             trader_rec["rationale"] = "RSI indicates overbought, potential short-term pullback."
 
-    pe = info.get('trailingPE', 'N/A')
-    dividend_yield = info.get('dividendYield', 'N/A')
-
     if isinstance(price, (int, float)) and isinstance(sma200, (int, float)):
         if price > sma200:
             investor_rec["action"] = "Consider Accumulate/Hold"
@@ -276,8 +299,6 @@ if search_button and ticker_input:
             st.error("❌ Could not retrieve data. Check ticker symbol.")
         else:
             vix, us10y_yield, macro_note, cycle_note = get_macro_and_market_cycle()
-            
-            # Use alternative.me API for Fear & Greed Index (more reliable)
             fear_greed_index_value = get_fear_greed_index_alternative()
             news_summary = get_news_summary_placeholder()
 
