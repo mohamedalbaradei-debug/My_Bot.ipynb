@@ -514,7 +514,7 @@ if analyze_button and ticker_input:
                 distance_to_resistance = ((analysis['resistance'] - analysis['current_price']) / analysis['current_price']) * 100
                 st.caption(f"±{min(distance_to_support, distance_to_resistance):.1f}% to nearest level")
             
-            with sr_col2:
+            with sr_col3:
                 st.markdown(f"**🔴 Resistance**")
                 st.markdown(f"### ${analysis['resistance']:.2f}")
                 st.caption("Key selling zone")
