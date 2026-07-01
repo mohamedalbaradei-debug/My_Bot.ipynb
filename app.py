@@ -1,97 +1,240 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import warnings
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 import plotly.graph_objects as go
-
-# Import pandas_ta with error handling
-try:
-    import pandas_ta as ta
-except ImportError:
-    ta = None
+from urllib.parse import quote
+import json
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="AI Investment Analyst Bot", layout="wide")
-st.title("🤖 AI Investment Analyst Bot")
-st.write("Enter a ticker symbol to get comprehensive market research and investment analysis")
+st.set_page_config(page_title="Professional Investment Analyst Bot", layout="wide", initial_sidebar_state="expanded")
 
-print("⏳ Loading data libraries...")
+# Custom CSS for professional styling
+st.markdown("""
+<style>
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    .bullish { color: #00D084; font-weight: bold; }
+    .bearish { color: #FF6B6B; font-weight: bold; }
+    .neutral { color: #FFB627; font-weight: bold; }
+    .section-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 10px 15px;
+        border-radius: 5px;
+        font-size: 18px;
+        font-weight: bold;
+        margin: 20px 0 10px 0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- Configuration ---
-# You can add your own news or X commentary manually in the template at the bottom
-# ---
+# ============ TECHNICAL INDICATORS CALCULATION ============
+
+def calculate_rsi(data, period=14):
+    """Calculate RSI without pandas_ta"""
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(data, fast=12, slow=26, signal=9):
+    """Calculate MACD without pandas_ta"""
+    ema_fast = data.ewm(span=fast).mean()
+    ema_slow = data.ewm(span=slow).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal).mean()
+    macd_histogram = macd - macd_signal
+    return macd, macd_signal, macd_histogram
+
+def calculate_atr(high, low, close, period=14):
+    """Calculate Average True Range"""
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
+
+def calculate_bollinger_bands(data, period=20, num_std=2):
+    """Calculate Bollinger Bands"""
+    sma = data.rolling(window=period).mean()
+    std = data.rolling(window=period).std()
+    upper = sma + (std * num_std)
+    lower = sma - (std * num_std)
+    return upper, sma, lower
+
+def calculate_stochastic(high, low, close, period=14, smooth_k=3, smooth_d=3):
+    """Calculate Stochastic Oscillator"""
+    lowest_low = low.rolling(window=period).min()
+    highest_high = high.rolling(window=period).max()
+    k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+    k_line = k_percent.rolling(window=smooth_k).mean()
+    d_line = k_line.rolling(window=smooth_d).mean()
+    return k_line, d_line
+
+def get_market_breadth():
+    """Get simplified market breadth - TRIN proxy using S&P 500"""
+    try:
+        spy = yf.download("SPY", period="1d", progress=False)
+        if not spy.empty:
+            volume = spy['Volume'].iloc[-1]
+            close = spy['Close'].iloc[-1]
+            open_price = spy['Open'].iloc[-1]
+            
+            if close > open_price:
+                return "Bullish Breadth", volume
+            else:
+                return "Bearish Breadth", volume
+        return "N/A", "N/A"
+    except:
+        return "N/A", "N/A"
+
+def get_excess_liquidity_index():
+    """Calculate simplified excess liquidity indicator"""
+    try:
+        btc = yf.download("BTC-USD", period="30d", progress=False)
+        if len(btc) > 1:
+            recent_vol = btc['Volume'].iloc[-1]
+            avg_vol = btc['Volume'].rolling(window=20).mean().iloc[-1]
+            liquidity_ratio = recent_vol / avg_vol if avg_vol > 0 else 1
+            
+            if liquidity_ratio > 1.3:
+                return f"High Liquidity ({liquidity_ratio:.2f}x) - 🟢 Expansionary", "bullish"
+            elif liquidity_ratio < 0.7:
+                return f"Low Liquidity ({liquidity_ratio:.2f}x) - 🔴 Contractionary", "bearish"
+            else:
+                return f"Normal Liquidity ({liquidity_ratio:.2f}x) - 🟡 Neutral", "neutral"
+        return "N/A", "N/A"
+    except:
+        return "N/A", "N/A"
+
+# ============ NEWS SCRAPING WITHOUT API ============
+
+def get_news_from_finviz(ticker):
+    """Fetch news from Finviz without API"""
+    try:
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        news_items = []
+        # Try to find news table
+        news_table = soup.find('table', {'class': 'news-table'})
+        if news_table:
+            rows = news_table.findAll('tr')
+            for row in rows[:5]:  # Get top 5 news
+                try:
+                    cols = row.findAll('td')
+                    if len(cols) >= 2:
+                        title = cols[1].get_text(strip=True)
+                        time = cols[0].get_text(strip=True)
+                        news_items.append(f"• **{time}** - {title}")
+                except:
+                    continue
+        
+        if news_items:
+            return "\n".join(news_items)
+        else:
+            return "• No recent news found. Check financial news websites for updates."
+    except:
+        return "• Unable to fetch news. Try checking Yahoo Finance, Bloomberg, or CNBC directly."
+
+def get_news_from_yahoo(ticker):
+    """Fetch news from Yahoo Finance"""
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        news = ticker_obj.news
+        if news:
+            news_items = []
+            for item in news[:5]:
+                try:
+                    title = item.get('title', 'No title')
+                    source = item.get('source', 'Unknown')
+                    news_items.append(f"• **{source}**: {title}")
+                except:
+                    pass
+            if news_items:
+                return "\n".join(news_items)
+        return "• No recent news available from Yahoo Finance."
+    except:
+        return "• Unable to fetch news from Yahoo Finance."
+
+# ============ MACRO AND MARKET DATA ============
 
 def get_macro_and_market_cycle():
-    """Fetch basic macro context: CPI, GDP, NFP proxies, yield curve, VIX, Fed rate probability."""
-    # VIX
+    """Fetch macro data"""
     try:
         vix_df = yf.download("^VIX", period="2d", progress=False)
-        if not vix_df.empty:
-            vix = vix_df['Close'].iloc[-1].item() # Extract scalar value
-        else:
-            vix = "N/A"
-    except Exception as e:
-        vix = f"Error: {e}"
+        vix = vix_df['Close'].iloc[-1].item() if not vix_df.empty else "N/A"
+    except:
+        vix = "N/A"
 
-    # 10-year Treasury Yield
     try:
         tnx_df = yf.download("^TNX", period="2d", progress=False)
-        if not tnx_df.empty:
-            us10y_yield = tnx_df['Close'].iloc[-1].item() # Extract scalar value
-        else:
-            us10y_yield = "N/A"
-    except Exception as e:
-        us10y_yield = f"Error: {e}"
+        us10y_yield = tnx_df['Close'].iloc[-1].item() if not tnx_df.empty else "N/A"
+    except:
+        us10y_yield = "N/A"
 
-    macro_note = (
-        """📝 Macro data (general commentary based on recent trends):
-  • CPI (~3.4%): Consumer Price Index, measures inflation. Current level is above the Fed's 2% target, suggesting persistent inflation (bearish for bonds, mixed for stocks depending on earnings).
-  • GDP (~3.2%): Gross Product, measures economic output. Current growth is solid, indicating a healthy economy (bullish).
-  • NFP (~+272k): Non-Farm Payrolls, measures job creation. Strong job growth indicates a robust labor market but could fuel inflation concerns (mixed).
-  • Fed Funds Rate: Fed likely on hold (83% prob), meaning interest rates are expected to remain stable in the short term."""
-    )
-    cycle_note = (
-        "Market Cycle: Yield curve slightly inverted, late‑cycle dynamics. "
-        "General commentary on sector rotation."
-    )
-    return vix, us10y_yield, macro_note, cycle_note
+    try:
+        dxy_df = yf.download("DXY=F", period="2d", progress=False)
+        dxy = dxy_df['Close'].iloc[-1].item() if not dxy_df.empty else "N/A"
+    except:
+        dxy = "N/A"
+
+    macro_note = "📊 Market Context: Monitor inflation, GDP growth, unemployment, and Fed policy."
+    cycle_note = "📈 Market Cycle: Late-cycle dynamics with fluctuating volatility."
+    
+    return vix, us10y_yield, dxy, macro_note, cycle_note
+
+# ============ ASSET DATA WITH INDICATORS ============
 
 def get_asset_data(ticker):
-    """Fetch price, technicals, fundamentals for any asset type."""
+    """Fetch 2-year data with comprehensive technical indicators"""
     try:
         asset = yf.Ticker(ticker)
         info = asset.info
-        # Price history
-        df = asset.history(period="1y")
+        df = asset.history(period="2y")
         if df.empty:
-            return None, None, None, None # Return 4 Nones
+            return None, None, None, None
 
-        # Technical indicators (require at least 14 periods for RSI)
-        if ta is not None and len(df) >= 200: # Ensure enough data for 200-day SMA
-            try:
-                df.ta.rsi(length=14, append=True)
-                df.ta.macd(append=True)
-                df.ta.sma(length=50, append=True)
-                df.ta.sma(length=200, append=True)
-            except:
-                # Fallback manual calculation
-                if len(df) >= 50:
-                    df['SMA_50'] = df['Close'].rolling(window=50).mean()
-                if len(df) >= 200:
-                    df['SMA_200'] = df['Close'].rolling(window=200).mean()
-        else:
-            # Manual calculation fallback
-            if len(df) >= 50:
-                df['SMA_50'] = df['Close'].rolling(window=50).mean()
-            if len(df) >= 200:
-                df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        # Calculate technical indicators
+        df['RSI_14'] = calculate_rsi(df['Close'], 14)
+        macd, macd_signal, macd_hist = calculate_macd(df['Close'])
+        df['MACD'] = macd
+        df['MACD_Signal'] = macd_signal
+        df['MACD_Hist'] = macd_hist
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        df['ATR_14'] = calculate_atr(df['High'], df['Low'], df['Close'], 14)
+        
+        bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(df['Close'])
+        df['BB_Upper'] = bb_upper
+        df['BB_Middle'] = bb_middle
+        df['BB_Lower'] = bb_lower
+        
+        k_line, d_line = calculate_stochastic(df['High'], df['Low'], df['Close'])
+        df['Stoch_K'] = k_line
+        df['Stoch_D'] = d_line
 
-        # Support / Resistance (simple swing method on last 3 months)
-        recent = df.tail(60) # Approximating last 3 months with 60 data points
+        # Support & Resistance
+        recent = df.tail(60)
         support = recent['Low'].min()
         resistance = recent['High'].max()
 
@@ -99,451 +242,430 @@ def get_asset_data(ticker):
         previous = df.iloc[-2] if len(df) >= 2 else None
 
         ma_cross_status = "N/A"
-        if previous is not None and 'SMA_50' in df.columns and 'SMA_200' in df.columns:
-            if pd.notna(latest['SMA_50']) and pd.notna(latest['SMA_200']) and \
-               pd.notna(previous['SMA_50']) and pd.notna(previous['SMA_200']):
-                # Golden Cross: SMA50 crosses above SMA200
+        if previous is not None and pd.notna(latest['SMA_50']) and pd.notna(latest['SMA_200']):
+            if pd.notna(previous['SMA_50']) and pd.notna(previous['SMA_200']):
                 if previous['SMA_50'] <= previous['SMA_200'] and latest['SMA_50'] > latest['SMA_200']:
-                    ma_cross_status = "Golden Cross (Bullish)"
-                # Death Cross: SMA50 crosses below SMA200
+                    ma_cross_status = "🟢 Golden Cross (Bullish)"
                 elif previous['SMA_50'] >= previous['SMA_200'] and latest['SMA_50'] < latest['SMA_200']:
-                    ma_cross_status = "Death Cross (Bearish)"
+                    ma_cross_status = "🔴 Death Cross (Bearish)"
                 elif latest['SMA_50'] > latest['SMA_200']:
-                    ma_cross_status = "SMA50 > SMA200 (Bullish Trend)"
+                    ma_cross_status = "🟢 Bullish Trend"
                 elif latest['SMA_50'] < latest['SMA_200']:
-                    ma_cross_status = "SMA50 < SMA200 (Bearish Trend)"
+                    ma_cross_status = "🔴 Bearish Trend"
 
         analysis = {
             "current_price": latest['Close'],
-            "rsi": latest.get('RSI_14', 'N/A'),
-            "macd": latest.get('MACD_12_26_9', 'N/A'),
-            "macd_signal": latest.get('MACDs_12_26_9', 'N/A'),
-            "sma50": latest.get('SMA_50', 'N/A'),
-            "sma200": latest.get('SMA_200', 'N/A'),
+            "rsi": latest.get('RSI_14', np.nan),
+            "macd": latest.get('MACD', np.nan),
+            "macd_signal": latest.get('MACD_Signal', np.nan),
+            "macd_hist": latest.get('MACD_Hist', np.nan),
+            "sma50": latest.get('SMA_50', np.nan),
+            "sma200": latest.get('SMA_200', np.nan),
+            "atr": latest.get('ATR_14', np.nan),
+            "stoch_k": latest.get('Stoch_K', np.nan),
+            "stoch_d": latest.get('Stoch_D', np.nan),
+            "bb_upper": latest.get('BB_Upper', np.nan),
+            "bb_lower": latest.get('BB_Lower', np.nan),
+            "bb_middle": latest.get('BB_Middle', np.nan),
             "support": support,
             "resistance": resistance,
             "volume": latest['Volume'],
-            "change_1d": (latest['Close'] - df.iloc[-2]['Close']) / df.iloc[-2]['Close'] * 100 if len(df) >= 2 else 'N/A',
+            "change_1d": (latest['Close'] - df.iloc[-2]['Close']) / df.iloc[-2]['Close'] * 100 if len(df) >= 2 else 0,
             "ma_cross_status": ma_cross_status
         }
 
-        # Determine asset type from info
         quote_type = info.get('quoteType', '').lower()
         return df, analysis, info, quote_type
     except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
+        st.error(f"Error fetching {ticker}: {e}")
         return None, None, None, None
 
-# Helper functions for technical analysis sentiment
-def get_rsi_sentiment(rsi):
-    if not isinstance(rsi, (int, float)): return "N/A"
-    if rsi < 30: return "Bullish (Oversold - potential rebound)"
-    if rsi > 70: return "Bearish (Overbought - potential reversal)"
-    if rsi >= 50: return "Neutral/Bullish (Stronger momentum)"
-    return "Neutral/Bearish (Weaker momentum)"
+# ============ SENTIMENT FUNCTIONS ============
 
-def get_macd_sentiment(macd, macd_signal):
-    if not (isinstance(macd, (int, float)) and isinstance(macd_signal, (int, float))): return "N/A"
-    if macd > macd_signal: return "Bullish (Momentum trending up)"
-    if macd < macd_signal: return "Bearish (Momentum trending down)"
-    return "Neutral (Crossover pending)"
+def get_rsi_sentiment(rsi):
+    if pd.isna(rsi): return "⚪ N/A", "neutral"
+    if rsi < 30: return "🟢 Oversold (BUY Signal)", "bullish"
+    if rsi > 70: return "🔴 Overbought (SELL Signal)", "bearish"
+    if rsi >= 50: return "🟢 Bullish Momentum", "bullish"
+    return "🟡 Weak Momentum", "neutral"
+
+def get_macd_sentiment(macd, signal):
+    if pd.isna(macd) or pd.isna(signal): return "⚪ N/A", "neutral"
+    if macd > signal: return "🟢 Bullish (Momentum Up)", "bullish"
+    if macd < signal: return "🔴 Bearish (Momentum Down)", "bearish"
+    return "🟡 Neutral", "neutral"
+
+def get_stoch_sentiment(k, d):
+    if pd.isna(k) or pd.isna(d): return "⚪ N/A", "neutral"
+    if k < 20 and d < 20: return "🟢 Oversold (BUY)", "bullish"
+    if k > 80 and d > 80: return "🔴 Overbought (SELL)", "bearish"
+    if k > d: return "🟢 Bullish Crossover", "bullish"
+    if k < d: return "🔴 Bearish Crossover", "bearish"
+    return "🟡 Neutral", "neutral"
 
 def get_sma_sentiment(price, sma):
-    if not (isinstance(price, (int, float)) and isinstance(sma, (int, float))): return "N/A"
-    if price > sma: return "Bullish (Price above average)"
-    if price < sma: return "Bearish (Price below average)"
-    return "Neutral (Price at average)"
+    if pd.isna(price) or pd.isna(sma): return "⚪ N/A", "neutral"
+    if price > sma: return "🟢 Bullish (Above MA)", "bullish"
+    if price < sma: return "🔴 Bearish (Below MA)", "bearish"
+    return "🟡 At MA", "neutral"
 
 def get_vix_sentiment(vix):
-    if not isinstance(vix, (int, float)): return "N/A"
-    if vix < 20: return "(Bullish - Low Volatility)"
-    if vix > 30: return "(Bearish - High Volatility)"
-    return "(Neutral - Moderate Volatility)"
+    if pd.isna(vix) or not isinstance(vix, (int, float)): return "⚪ N/A", "neutral"
+    if vix < 15: return "🟢 Very Low - Complacent Market", "bullish"
+    if vix < 20: return "🟢 Low Volatility", "bullish"
+    if vix > 30: return "🔴 High Fear Index", "bearish"
+    return "🟡 Moderate Volatility", "neutral"
 
-def get_us10y_yield_sentiment(us10y_yield):
-    if not isinstance(us10y_yield, (int, float)): return "N/A"
-    if us10y_yield < 3.0: return "(Bullish - Lower Cost of Capital)"
-    if us10y_yield > 4.0: return "(Bearish - Higher Cost of Capital)"
-    return "(Neutral)"
+def get_us10y_sentiment(yield_val):
+    if pd.isna(yield_val) or not isinstance(yield_val, (int, float)): return "⚪ N/A", "neutral"
+    if yield_val < 3.0: return "🟢 Lower Rates - Bullish", "bullish"
+    if yield_val > 4.5: return "🔴 Higher Rates - Bearish", "bearish"
+    return "🟡 Moderate", "neutral"
 
-# Placeholder function for news due to scraping difficulties
-def get_news_summary_placeholder():
-    """Provides a placeholder message for news due to scraping difficulties."""
-    return "• News unavailable due to website scraping restrictions (403 Forbidden). Consider using a dedicated news API for reliable data."
+def get_atr_sentiment(atr, price):
+    if pd.isna(atr) or pd.isna(price): return "⚪ N/A", "neutral"
+    atr_percent = (atr / price) * 100
+    if atr_percent > 3: return f"🔴 High Volatility ({atr_percent:.1f}%)", "bearish"
+    if atr_percent < 1: return f"🟢 Low Volatility ({atr_percent:.1f}%)", "bullish"
+    return f"🟡 Moderate Volatility ({atr_percent:.1f}%)", "neutral"
 
-# Function to fetch Fear & Greed Index from feargreedmeter.com with updated URL and selectors
-def get_fear_greed_index_placeholder():
-    """Fetches the Fear & Greed Index from feargreedmeter.com using the provided URL."""
-    url = "https://feargreedmeter.com/fear-and-greed-index"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+def get_bb_sentiment(price, bb_upper, bb_lower):
+    if pd.isna(price) or pd.isna(bb_upper) or pd.isna(bb_lower): return "⚪ N/A", "neutral"
+    if price > bb_upper: return "🔴 Above Upper Band (Overbought)", "bearish"
+    if price < bb_lower: return "🟢 Below Lower Band (Oversold)", "bullish"
+    return "🟡 Within Bands (Normal)", "neutral"
+
+# ============ COMPARISON CHART ============
+
+def create_comparison_chart(ticker, df):
+    """Create 2-year performance comparison with S&P 500"""
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() # Raise an exception for HTTP errors
-        soup = BeautifulSoup(response.text, 'html.parser')
+        spy = yf.download("SPY", start=df.index[0], end=df.index[-1], progress=False)
+        
+        # Normalize prices to start at 100
+        ticker_normalized = (df['Close'] / df['Close'].iloc[0]) * 100
+        spy_normalized = (spy['Close'] / spy['Close'].iloc[0]) * 100
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df.index, y=ticker_normalized,
+            name=f'{ticker}', line=dict(color='#667eea', width=2)
+        ))
+        fig.add_trace(go.Scatter(
+            x=spy.index, y=spy_normalized,
+            name='S&P 500 (SPY)', line=dict(color='#FF6B6B', width=2, dash='dash')
+        ))
+        
+        fig.update_layout(
+            title=f'{ticker} vs S&P 500 (2-Year Performance)',
+            xaxis_title='Date',
+            yaxis_title='Performance (Base = 100)',
+            hovermode='x unified',
+            height=400,
+            template='plotly_white'
+        )
+        return fig
+    except:
+        return None
 
-        # Updated selectors based on current inspection of feargreedmeter.com/fear-and-greed-index
-        sentiment_tag = soup.find('div', class_='fng-gauge_title')
-        sentiment = sentiment_tag.text.strip() if sentiment_tag else 'N/A'
+# ============ MAIN UI ============
 
-        index_value_tag = soup.find('div', class_='fng-gauge_value-text')
-        index_value = index_value_tag.text.strip() if index_value_tag else 'N/A'
+st.title("🚀 Professional Investment Analyst Bot")
+st.markdown("### Enterprise-Grade Technical Analysis & Market Intelligence")
 
-        if sentiment == 'N/A' and index_value == 'N/A':
-            return "N/A (Could not find index on feargreedmeter.com with current selectors. Website structure may have changed.)"
-
-        return f"{sentiment} ({index_value})"
-    except requests.exceptions.RequestException as e:
-        return f"N/A (Error fetching data from feargreedmeter.com: {e})"
-    except Exception as e:
-        return f"N/A (Error parsing data from feargreedmeter.com: {e})"
-
-def get_fear_greed_index_alternative():
-    """Fetch Fear & Greed Index from alternative.me API (more reliable)."""
-    url = "https://api.alternative.me/fng/?limit=1"
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data['data']:
-            index_value = data['data'][0]['value']
-            index_classification = data['data'][0]['value_classification']
-            return f"{index_classification} ({index_value}/100)"
-        else:
-            return "N/A (No data available)"
-    except Exception as e:
-        return f"N/A (Error: {str(e)})"
-
-def get_top_performing_stocks(stock_list, num_top_stocks=5):
-    """Fetches 1-year growth for a list of stocks and returns the top performers."""
-    performance = []
-    for ticker in stock_list:
-        try:
-            df_perf = yf.download(ticker, period="1y", progress=False)
-            if not df_perf.empty and len(df_perf) > 1:
-                current_price = df_perf['Close'].iloc[-1].item()
-                one_year_ago_price = df_perf['Close'].iloc[0].item()
-
-                if pd.isna(one_year_ago_price) or one_year_ago_price == 0: # Handle NaN or zero price
-                    continue
-
-                growth_percent = ((current_price - one_year_ago_price) / one_year_ago_price) * 100
-                performance.append({'ticker': ticker, 'growth_percent': growth_percent})
-        except Exception as e:
-            continue
-
-    # Sort by growth_percent in descending order
-    top_performers = sorted(performance, key=lambda x: x['growth_percent'], reverse=True)
-    return top_performers[:num_top_stocks]
-
-def get_recommendations(price, rsi, macd, macd_signal, sma50, sma200, info, ma_cross_status, support, resistance):
-    trader_rec = {"action": "", "rationale": "", "stop_loss": "None", "target": "None"}
-    investor_rec = {"action": "", "rationale": ""}
-
-    bullish_signals = 0
-    bearish_signals = 0
-
-    # Evaluate technicals for sentiment
-    if isinstance(rsi, (int, float)):
-        if rsi < 40: bullish_signals += 1
-        if rsi > 60: bearish_signals += 1
-
-    if isinstance(macd, (int, float)) and isinstance(macd_signal, (int, float)):
-        if macd > macd_signal: bullish_signals += 1
-        if macd < macd_signal: bearish_signals += 1
-
-    if isinstance(price, (int, float)):
-        if isinstance(sma50, (int, float)) and price > sma50: bullish_signals += 1
-        if isinstance(sma50, (int, float)) and price < sma50: bearish_signals += 1
-        if isinstance(sma200, (int, float)) and price > sma200: bullish_signals += 1
-        if isinstance(sma200, (int, float)) and price < sma200: bearish_signals += 1
-
-    # Add MA Cross status to sentiment
-    if "Golden Cross" in ma_cross_status: bullish_signals += 2 # Strong bullish signal
-    if "Death Cross" in ma_cross_status: bearish_signals += 2 # Strong bearish signal
-
-    # Trader Recommendation
-    if bullish_signals > bearish_signals:
-        trader_rec["action"] = "Consider Buy/Long"
-        trader_rec["rationale"] = "Technical indicators show short-term bullish momentum. Monitor for entry points."
-        trader_rec["stop_loss"] = f"${sma50:.2f}" if isinstance(sma50, (int, float)) else "None"
-        trader_rec["target"] = f"${resistance:.2f}" if isinstance(resistance, (int, float)) else "None"
-    elif bearish_signals > bullish_signals:
-        trader_rec["action"] = "Consider Sell/Short"
-        trader_rec["rationale"] = "Technical indicators show short-term bearish momentum. Monitor for exit points."
-        trader_rec["stop_loss"] = f"${sma50:.2f}" if isinstance(sma50, (int, float)) else "None"
-        trader_rec["target"] = f"${support:.2f}" if isinstance(support, (int, float)) else "None"
-    else:
-        trader_rec["action"] = "Hold/Neutral"
-        trader_rec["rationale"] = "Mixed signals, market direction unclear for short-term trading."
-
-    # RSI Overbought/Oversold specific check for traders
-    if isinstance(rsi, (int, float)):
-        if rsi < 30: # Oversold
-            trader_rec["action"] = "Consider Buy (Oversold)"
-            trader_rec["rationale"] = "RSI indicates the asset is oversold, suggesting a potential short-term bounce or reversal. High risk."
-        elif rsi > 70: # Overbought
-            trader_rec["action"] = "Consider Sell/Short (Overbought)"
-            trader_rec["rationale"] = "RSI indicates the asset is overbought, suggesting a potential short-term pullback or reversal. High risk."
-
-    # Fetch fundamental data for long-term recommendations
-    pe = info.get('trailingPE', 'N/A')
-    dividend_yield = info.get('dividendYield', 'N/A')
-
-    # Initial Long-term Investor Recommendation based on SMA200
-    if isinstance(price, (int, float)) and isinstance(sma200, (int, float)):
-        if price > sma200:
-            investor_rec["action"] = "Consider Accumulate/Hold"
-            investor_rec["rationale"] = "Price is above the long-term 200-day moving average, suggesting an uptrend."
-        elif price < sma200:
-            investor_rec["action"] = "Consider Avoid/Reduce Holdings"
-            investor_rec["rationale"] = "Price is below the long-term 200-day moving average, suggesting a downtrend or consolidation."
-        else: # price == sma200 or close
-            investor_rec["action"] = "Hold/Neutral"
-            investor_rec["rationale"] = "Long-term trend is neutral or unclear based on 200-day MA."
-    else: # SMA200 data not available or invalid
-        investor_rec["action"] = "Hold/Neutral"
-        investor_rec["rationale"] = "Long-term trend assessment is limited due to insufficient data."
-
-    # Refine recommendation based on P/E Ratio (primarily for stocks)
-    if info.get('quoteType', '').lower() == 'equity':
-        if isinstance(pe, (int, float)) and pe > 0:
-            if pe > 25: # High P/E (threshold can be adjusted)
-                if "Accumulate" in investor_rec["action"] or "Hold" in investor_rec["action"]:
-                    investor_rec["rationale"] += " However, a high P/E ratio might indicate overvaluation, suggesting caution."
-                elif "Neutral" in investor_rec["action"]:
-                    investor_rec["rationale"] += " A high P/E ratio suggests potential overvaluation."
-                    investor_rec["action"] = "Hold/Monitor (High P/E)"
-                elif "Avoid" in investor_rec["action"] or "Reduce" in investor_rec["action"]:
-                    investor_rec["rationale"] += " Further, a high P/E ratio reinforces potential overvaluation risks."
-            elif pe < 15: # Low P/E (threshold can be adjusted)
-                if "Avoid" in investor_rec["action"] or "Reduce" in investor_rec["action"]:
-                    investor_rec["rationale"] += " However, a relatively low P/E ratio might suggest undervaluation, warranting re-evaluation."
-                    investor_rec["action"] = "Re-evaluate (Low P/E)"
-                elif "Neutral" in investor_rec["action"]:
-                    investor_rec["rationale"] += " A relatively low P/E ratio might suggest undervaluation."
-                    investor_rec["action"] = "Hold/Consider Accumulate (Low P/E)"
-                elif "Accumulate" in investor_rec["action"] or "Hold" in investor_rec["action"]:
-                    investor_rec["rationale"] += " This is further supported by a relatively low P/E ratio, suggesting potential value."
-
-        # Refine recommendation based on Dividend Yield (primarily for stocks)
-        if isinstance(dividend_yield, (int, float)) and dividend_yield > 0.02: # Attractive dividend yield (threshold can be adjusted)
-            if "Accumulate" in investor_rec["action"] or "Hold" in investor_rec["action"]:
-                investor_rec["rationale"] += " The attractive dividend yield also enhances its appeal for income investors."
-            elif "Neutral" in investor_rec["action"] or "Monitor" in investor_rec["action"] or "Re-evaluate" in investor_rec["action"]:
-                investor_rec["rationale"] += " An attractive dividend yield could make it suitable for income-focused investors."
-                if "Monitor" not in investor_rec["action"] and "Re-evaluate" not in investor_rec["action"]:
-                     investor_rec["action"] = "Hold/Consider Accumulate (for Income)"
-            elif "Avoid" in investor_rec["action"] or "Reduce" in investor_rec["action"]:
-                investor_rec["rationale"] += " Despite an attractive dividend yield, long-term trend or valuation concerns may persist."
-
-    return trader_rec, investor_rec
-
-def generate_report(ticker, df, analysis, info, quote_type, vix, us10y_yield, macro_note, cycle_note, news_summary, fear_greed_index_value, top_performers=None, bitcoin_price="N/A", crude_oil_price="N/A", gold_price="N/A"):
-    """Build the full report string."""
-    today_str = datetime.today().strftime('%Y-%m-%d %H:%M')
-    name = info.get('shortName', ticker)
-    price = analysis['current_price']
-    rsi = analysis['rsi']
-    macd = analysis['macd']
-    macd_signal = analysis['macd_signal']
-    sma50 = analysis['sma50']
-    sma200 = analysis['sma200']
-    support = analysis['support']
-    resistance = analysis['resistance']
-    volume = analysis['volume']
-    change = analysis['change_1d']
-    ma_cross_status = analysis['ma_cross_status']
-
-    # Get sentiment for VIX and US10Y Yield
-    vix_sentiment = get_vix_sentiment(vix)
-    us10y_yield_sentiment = get_us10y_yield_sentiment(us10y_yield)
-
-    # Asset‑specific fundamentals
-    fund_desc = ""
-    if quote_type == 'etf':
-        expense_ratio = info.get('annualReportExpenseRatio', 'N/A')
-        aum = info.get('totalAssets', 'N/A')
-
-        # New logic for top holdings as a table
-        top_holdings = info.get('holdings', [])
-        top_5_holdings = top_holdings[:5] # Get top 5
-
-        holdings_table = "N/A"
-        if top_5_holdings:
-            holdings_table = "| Symbol | % of Portfolio |\n|---|---|\n"
-            for h in top_5_holdings:
-                symbol = h.get('symbol', 'N/A')
-                holding_percent = h.get('holdingPercent', 0) * 100
-                holdings_table += f"| {symbol} | {holding_percent:.1f}% |\n"
-
-        fund_desc = f"Expense Ratio: {expense_ratio}\nAUM: {aum}\nTop Holdings (as of last update):\n{holdings_table}"
-
-    elif quote_type == 'cryptocurrency':
-        # More detailed crypto fundamentals would require a dedicated API
-        fund_desc = "Asset: Cryptocurrency (limited fundamental data via yfinance)"
-    elif 'bond' in quote_type or ticker.upper() in ['TLT','IEF','SHY','AGG','BND']:
-        fund_desc = "Asset: Bond/Fixed Income (limited fundamental data via yfinance)"
-    else:
-        # Stock
-        pe = info.get('trailingPE', 'N/A')
-        market_cap = info.get('marketCap', 'N/A')
-        sector = info.get('sector', 'N/A')
-        dividend_yield = info.get('dividendYield', 'N/A')
-        fund_desc = f"P/E: {pe}\nMarket Cap: {market_cap}\nSector: {sector}\nDividend Yield: {dividend_yield}"
-
-    # Get recommendations
-    trader_rec, investor_rec = get_recommendations(price, rsi, macd, macd_signal, sma50, sma200, info, ma_cross_status, support, resistance)
-
-    # Build top performing stocks section
-    scanner_output = ""
-    if top_performers:
-        scanner_output += "\n📈 **Top Performing Stocks (1-Year Growth)**\n"
-        for item in top_performers:
-            scanner_output += f"• {item['ticker']}: {item['growth_percent']:.2f}%\n"
-    else:
-        scanner_output += "\n📈 **Top Performing Stocks (1-Year Growth)**\n• No top performing stocks found or data unavailable for scanning list.\n"
-
-    # Build the report
-    report = f"""
-🤖 **AI Investment Analyst Report** — {today_str}
-
-📊 **Asset:** {ticker.upper()} — {name}
-🔖 **Type:** {quote_type.title()}
-
-🌍 **Macro & Market Context**
-• VIX: {f"{vix:.2f}" if isinstance(vix, (int, float)) else str(vix)} {vix_sentiment}
-{macro_note}
-• {cycle_note}
-
-📰 **Latest News**
-{news_summary}
-
-🤩 **Sentiment Analysis**
-• Fear & Greed Index: {fear_greed_index_value}
-
-🐦 **X Sentiment (from top creators)**
-> (Requires social media API and sentiment analysis for automation)
-
-📈 **Technical Snapshot**
-• Price: ${price:.2f}  |  Daily change: {change:+.2f}%
-• RSI(14): {f"{rsi:.1f}" if isinstance(rsi, (int, float)) else str(rsi)}
-    _Explanation: RSI measures the speed and change of price movements. Over 70 is often considered overbought (potential reversal), under 30 oversold (potential rebound).  Sentiment: {get_rsi_sentiment(rsi)}_
-• MACD: {f"{macd:.4f}" if isinstance(macd, (int, float)) else str(macd)} (Signal: {f"{macd_signal:.4f}" if isinstance(macd_signal, (int, float)) else str(macd_signal)})
-    _Explanation: MACD shows the relationship between two moving averages. A crossover above the signal line indicates bullish momentum, below indicates bearish momentum. Sentiment: {get_macd_sentiment(macd, macd_signal)}_
-• 50‑day MA: ${f"{sma50:.2f}" if isinstance(sma50, (int, float)) else str(sma50)}
-    _Explanation: The 50-day Simple Moving Average (SMA) reflects short to medium-term price trends. Price above it suggests an uptrend. Sentiment: {get_sma_sentiment(price, sma50)}_
-• 200‑day MA: ${f"{sma200:.2f}" if isinstance(sma200, (int, float)) else str(sma200)}
-    _Explanation: The 200-day Simple Moving Average (SMA) reflects long-term price trends. Price above it suggests a long-term uptrend. Sentiment: {get_sma_sentiment(price, sma200)}_
-• Moving Average Cross: {ma_cross_status}
-    _Explanation: A **Golden Cross** (50-day SMA crosses above 200-day SMA) is a bullish signal. A **Death Cross** (50-day SMA crosses below 200-day SMA) is a a bearish signal._
-• Support: ${support:.2f}  |  Resistance: ${resistance:.2f}
-    _Explanation: Support is a price level where a downtrend can be expected to pause due to demand. Resistance is where an uptrend can be expected to pause due to supply._
-• Volume: {f"{volume:,.0f}" if isinstance(volume, (int, float)) else str(volume)}
-    _Explanation: Volume indicates the total number of shares/contracts traded. High volume often confirms the strength of a price move; low volume suggests weakness._
-
-📊 **Options Flow & Smart Money**
-> (Requires specialized options data provider API for automation)
-
-📋 **Fundamentals / Key Data**
-{fund_desc}
-
-{scanner_output}
-
-🏦 **Bond / Yield Context**
-• US10Y Yield: {f"{us10y_yield:.2f}" if isinstance(us10y_yield, (int, float)) else str(us10y_yield)}% {us10y_yield_sentiment}
-
-₿ **Crypto Context**
-• Bitcoin (BTC-USD) Price: ${f"{bitcoin_price:,.2f}" if isinstance(bitcoin_price, (int, float)) else str(bitcoin_price)} (Indicates risk-on/risk-off sentiment.)
-
-🛢️ **Commodity Context**
-• Crude Oil (CL=F) Price: ${f"{crude_oil_price:,.2f}" if isinstance(crude_oil_price, (int, float)) else str(crude_oil_price)} (Can indicate global economic activity and inflationary pressures.)
-• Gold (GC=F) Price: ${f"{gold_price:,.2f}" if isinstance(gold_price, (int, float)) else str(gold_price)} (Often seen as a safe-haven asset; rising prices can indicate uncertainty or inflation concerns.)
-
-🔮 **Risk‑Adjusted Recommendations**
-
-• **For Traders (Short-term focus):**
-  Action: {trader_rec['action']}
-  Rationale: {trader_rec['rationale']}
-  Stop-loss: {trader_rec['stop_loss']}
-  Target 1: {trader_rec['target']}
-
-• **For Long-term Investors (Fundamental/Trend focus):**
-  Action: {investor_rec['action']}
-  Rationale: {investor_rec['rationale']}
-
-⚠️ **Disclaimer:** This is not financial advice. For educational purposes only. Past performance does not guarantee future results.
-"""
-    return report
-
-# Sidebar for ticker input
 with st.sidebar:
-    st.header("📊 Investment Analysis")
-    ticker_input = st.text_input("Enter Ticker (AAPL, QQQ, SPY, etc.):", placeholder="QQQ").upper()
-    search_button = st.button("Analyze", key="analyze_button")
+    st.header("⚙️ Analysis Settings")
+    ticker_input = st.text_input("Enter Ticker Symbol", placeholder="AAPL", value="").upper()
+    analyze_button = st.button("🔍 Analyze", use_container_width=True)
 
-# Main analysis
-if search_button and ticker_input:
-    with st.spinner(f"Analyzing {ticker_input}..."):
+if analyze_button and ticker_input:
+    with st.spinner(f"⏳ Analyzing {ticker_input} - Running comprehensive technical analysis..."):
         df, analysis, info, quote_type = get_asset_data(ticker_input)
         
         if analysis is None:
-            st.error("❌ Could not retrieve data. Check ticker symbol.")
+            st.error("❌ Could not retrieve data. Please verify the ticker symbol.")
         else:
-            vix, us10y_yield, macro_note, cycle_note = get_macro_and_market_cycle()
+            vix, us10y_yield, dxy, macro_note, cycle_note = get_macro_and_market_cycle()
+            breadth_sentiment, breadth_volume = get_market_breadth()
+            liquidity_status, liquidity_type = get_excess_liquidity_index()
             
-            # Use alternative.me API for Fear & Greed Index (more reliable)
-            fear_greed_index_value = get_fear_greed_index_alternative()
-            news_summary = get_news_summary_placeholder()
-
-            # --- Fetch Bitcoin price ---
-            try:
-                btc_data = yf.download("BTC-USD", period="1d", interval="1h", progress=False)
-                if not btc_data.empty:
-                    bitcoin_price = btc_data['Close'].iloc[-1].item()
-                else:
-                    bitcoin_price = "N/A"
-            except Exception as e:
-                bitcoin_price = f"Error: {e}"
-
-            # --- Fetch Crude Oil price (futures symbol) ---
-            try:
-                # Using 'CL=F' for Crude Oil Futures from Yahoo Finance
-                oil_data = yf.download("CL=F", period="1d", interval="1h", progress=False)
-                if not oil_data.empty:
-                    crude_oil_price = oil_data['Close'].iloc[-1].item()
-                else:
-                    crude_oil_price = "N/A"
-            except Exception as e:
-                crude_oil_price = f"Error: {e}"
-
-            # --- Fetch Gold price (futures symbol) ---
-            try:
-                # Using 'GC=F' for Gold Futures from Yahoo Finance
-                gold_data = yf.download("GC=F", period="1d", interval="1h", progress=False)
-                if not gold_data.empty:
-                    gold_price = gold_data['Close'].iloc[-1].item()
-                else:
-                    gold_price = "N/A"
-            except Exception as e:
-                gold_price = f"Error: {e}"
-
-            # --- Stock Scanner ---
-            # Define a list of popular stocks/ETFs to scan
-            scan_list = ['AAPL', 'MSFT', 'GOOG', 'AMZN', 'NVDA', 'TSLA', 'META', 'JPM', 'V', 'PG', 'XOM', 'CVX', 'DIA', 'QQQ', 'SMH', 'UNH']
-            print(f"🔍 Scanning {len(scan_list)} stocks for top 1-year growth...")
-            top_performers = get_top_performing_stocks(scan_list)
-
-            report = generate_report(ticker_input, df, analysis, info, quote_type, vix, us10y_yield, macro_note, cycle_note, news_summary, fear_greed_index_value, top_performers, bitcoin_price, crude_oil_price, gold_price)
+            # Get news
+            news = get_news_from_yahoo(ticker_input)
+            if "No recent" in news or "Unable" in news:
+                news = get_news_from_finviz(ticker_input)
             
-            # Display report
-            st.success(f"✅ Report generated for {ticker_input}")
-            st.markdown(report)
-            print("\n" + "="*60)
-            print(report)
-            print("="*60)
-            print("\n✅ Report generated automatically!")
+            # ========== HEADER SECTION ==========
+            st.markdown('<div class="section-header">📊 KEY METRICS DASHBOARD</div>', unsafe_allow_html=True)
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Current Price", f"${analysis['current_price']:.2f}")
+            with col2:
+                change_color = "🟢" if analysis['change_1d'] >= 0 else "🔴"
+                st.metric("1D Change", f"{analysis['change_1d']:+.2f}%", delta=f"{change_color}")
+            with col3:
+                st.metric("Volume", f"{analysis['volume']/1e6:.1f}M")
+            with col4:
+                if isinstance(vix, (int, float)):
+                    st.metric("VIX Index", f"{vix:.2f}")
+            with col5:
+                if isinstance(us10y_yield, (int, float)):
+                    st.metric("10Y Yield", f"{us10y_yield:.2f}%")
+            
+            st.markdown("---")
+            
+            # ========== TECHNICAL INDICATORS ==========
+            st.markdown('<div class="section-header">📈 TECHNICAL INDICATORS</div>', unsafe_allow_html=True)
+            
+            ind_col1, ind_col2, ind_col3, ind_col4 = st.columns(4)
+            
+            with ind_col1:
+                st.markdown("#### RSI(14) Momentum")
+                rsi_val = analysis['rsi']
+                if not pd.isna(rsi_val):
+                    rsi_sentiment, rsi_type = get_rsi_sentiment(rsi_val)
+                    color = "bullish" if rsi_type == "bullish" else "bearish" if rsi_type == "bearish" else "neutral"
+                    st.markdown(f"<span class='{color}'>{rsi_val:.1f}</span>", unsafe_allow_html=True)
+                    st.caption(rsi_sentiment)
+                else:
+                    st.info("Calculating...")
+            
+            with ind_col2:
+                st.markdown("#### MACD Trend")
+                macd_val = analysis['macd']
+                macd_sig = analysis['macd_signal']
+                if not pd.isna(macd_val) and not pd.isna(macd_sig):
+                    macd_sentiment, macd_type = get_macd_sentiment(macd_val, macd_sig)
+                    color = "bullish" if macd_type == "bullish" else "bearish" if macd_type == "bearish" else "neutral"
+                    st.markdown(f"<span class='{color}'>{macd_val:.4f}</span>", unsafe_allow_html=True)
+                    st.caption(macd_sentiment)
+                else:
+                    st.info("Calculating...")
+            
+            with ind_col3:
+                st.markdown("#### Stochastic %K")
+                stoch_k = analysis['stoch_k']
+                stoch_d = analysis['stoch_d']
+                if not pd.isna(stoch_k):
+                    stoch_sentiment, stoch_type = get_stoch_sentiment(stoch_k, stoch_d)
+                    color = "bullish" if stoch_type == "bullish" else "bearish" if stoch_type == "bearish" else "neutral"
+                    st.markdown(f"<span class='{color}'>{stoch_k:.1f}</span>", unsafe_allow_html=True)
+                    st.caption(stoch_sentiment)
+                else:
+                    st.info("Calculating...")
+            
+            with ind_col4:
+                st.markdown("#### ATR Volatility")
+                atr_val = analysis['atr']
+                if not pd.isna(atr_val):
+                    atr_sentiment, atr_type = get_atr_sentiment(atr_val, analysis['current_price'])
+                    color = "bullish" if atr_type == "bullish" else "bearish" if atr_type == "bearish" else "neutral"
+                    st.markdown(f"<span class='{color}'>${atr_val:.2f}</span>", unsafe_allow_html=True)
+                    st.caption(atr_sentiment)
+                else:
+                    st.info("Calculating...")
+            
+            st.markdown("---")
+            
+            # ========== MOVING AVERAGES & TREND ==========
+            st.markdown('<div class="section-header">🎯 TREND ANALYSIS</div>', unsafe_allow_html=True)
+            
+            trend_col1, trend_col2, trend_col3 = st.columns(3)
+            
+            with trend_col1:
+                st.markdown("#### 50-Day SMA")
+                sma50_val = analysis['sma50']
+                if not pd.isna(sma50_val):
+                    sma50_sentiment, sma50_type = get_sma_sentiment(analysis['current_price'], sma50_val)
+                    color = "bullish" if sma50_type == "bullish" else "bearish"
+                    st.markdown(f"<span class='{color}'>${sma50_val:.2f}</span>", unsafe_allow_html=True)
+                    st.caption(sma50_sentiment)
+            
+            with trend_col2:
+                st.markdown("#### 200-Day SMA")
+                sma200_val = analysis['sma200']
+                if not pd.isna(sma200_val):
+                    sma200_sentiment, sma200_type = get_sma_sentiment(analysis['current_price'], sma200_val)
+                    color = "bullish" if sma200_type == "bullish" else "bearish"
+                    st.markdown(f"<span class='{color}'>${sma200_val:.2f}</span>", unsafe_allow_html=True)
+                    st.caption(sma200_sentiment)
+            
+            with trend_col3:
+                st.markdown("#### Trend Status")
+                st.info(analysis['ma_cross_status'])
+            
+            st.markdown("---")
+            
+            # ========== SUPPORT & RESISTANCE ==========
+            st.markdown('<div class="section-header">💪 SUPPORT & RESISTANCE LEVELS</div>', unsafe_allow_html=True)
+            
+            sr_col1, sr_col2, sr_col3 = st.columns(3)
+            
+            with sr_col1:
+                st.markdown(f"**🟢 Support**")
+                st.markdown(f"### ${analysis['support']:.2f}")
+                st.caption("Key buying zone")
+            
+            with sr_col2:
+                st.markdown(f"**Current**")
+                st.markdown(f"### ${analysis['current_price']:.2f}")
+                distance_to_support = ((analysis['current_price'] - analysis['support']) / analysis['current_price']) * 100
+                distance_to_resistance = ((analysis['resistance'] - analysis['current_price']) / analysis['current_price']) * 100
+                st.caption(f"±{min(distance_to_support, distance_to_resistance):.1f}% to nearest level")
+            
+            with sr_col2:
+                st.markdown(f"**🔴 Resistance**")
+                st.markdown(f"### ${analysis['resistance']:.2f}")
+                st.caption("Key selling zone")
+            
+            st.markdown("---")
+            
+            # ========== MARKET BREADTH & LIQUIDITY ==========
+            st.markdown('<div class="section-header">🌊 MARKET BREADTH & LIQUIDITY</div>', unsafe_allow_html=True)
+            
+            breadth_col1, breadth_col2 = st.columns(2)
+            
+            with breadth_col1:
+                st.markdown("#### Market Breadth (TRIN Proxy)")
+                color = "bullish" if "Bullish" in breadth_sentiment else "bearish"
+                st.markdown(f"<span class='{color}'>{breadth_sentiment}</span>", unsafe_allow_html=True)
+                st.caption("S&P 500 volume analysis")
+            
+            with breadth_col2:
+                st.markdown("#### Liquidity Index")
+                color = "bullish" if liquidity_type == "bullish" else "bearish" if liquidity_type == "bearish" else "neutral"
+                st.markdown(f"<span class='{color}'>{liquidity_status}</span>", unsafe_allow_html=True)
+                st.caption("Market liquidity conditions")
+            
+            st.markdown("---")
+            
+            # ========== MACRO CONTEXT ==========
+            st.markdown('<div class="section-header">🌍 MACRO & MARKET CONTEXT</div>', unsafe_allow_html=True)
+            
+            macro_col1, macro_col2, macro_col3 = st.columns(3)
+            
+            with macro_col1:
+                st.markdown("#### VIX (Fear Index)")
+                if isinstance(vix, (int, float)):
+                    vix_sentiment, vix_type = get_vix_sentiment(vix)
+                    color = "bullish" if vix_type == "bullish" else "bearish"
+                    st.markdown(f"<span class='{color}'>{vix:.2f}</span>", unsafe_allow_html=True)
+                    st.caption(vix_sentiment)
+            
+            with macro_col2:
+                st.markdown("#### 10Y Treasury Yield")
+                if isinstance(us10y_yield, (int, float)):
+                    bond_sentiment, bond_type = get_us10y_sentiment(us10y_yield)
+                    color = "bullish" if bond_type == "bullish" else "bearish"
+                    st.markdown(f"<span class='{color}'>{us10y_yield:.2f}%</span>", unsafe_allow_html=True)
+                    st.caption(bond_sentiment)
+            
+            with macro_col3:
+                st.markdown("#### Dollar Index")
+                if isinstance(dxy, (int, float)):
+                    st.markdown(f"**{dxy:.2f}**")
+                    st.caption("USD strength indicator")
+            
+            st.markdown("---")
+            
+            # ========== 2-YEAR PERFORMANCE CHART ==========
+            st.markdown('<div class="section-header">📊 2-YEAR PERFORMANCE vs S&P 500</div>', unsafe_allow_html=True)
+            
+            comparison_fig = create_comparison_chart(ticker_input, df)
+            if comparison_fig:
+                st.plotly_chart(comparison_fig, use_container_width=True)
+            else:
+                st.warning("Could not generate comparison chart")
+            
+            st.markdown("---")
+            
+            # ========== PRICE CHART ==========
+            st.markdown('<div class="section-header">📈 PRICE CHART</div>', unsafe_allow_html=True)
+            
+            try:
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=df.index,
+                    open=df['Open'],
+                    high=df['High'],
+                    low=df['Low'],
+                    close=df['Close'],
+                    name='Price'
+                ))
+                
+                # Add SMA lines
+                fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], name='SMA50', line=dict(color='orange')))
+                fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], name='SMA200', line=dict(color='red')))
+                
+                fig.update_layout(
+                    title=f'{ticker_input} - 2 Year Price History with Moving Averages',
+                    xaxis_title='Date',
+                    yaxis_title='Price ($)',
+                    height=500,
+                    hovermode='x unified',
+                    template='plotly_white'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not generate price chart: {e}")
+            
+            st.markdown("---")
+            
+            # ========== NEWS SECTION ==========
+            st.markdown('<div class="section-header">📰 LATEST NEWS</div>', unsafe_allow_html=True)
+            
+            st.markdown(news)
+            
+            st.markdown("---")
+            
+            # ========== TRADING SIGNALS ==========
+            st.markdown('<div class="section-header">🎯 AI TRADING SIGNALS</div>', unsafe_allow_html=True)
+            
+            signal_col1, signal_col2 = st.columns(2)
+            
+            with signal_col1:
+                st.subheader("📊 Short-term (Traders)")
+                rsi_sig = "BUY" if analysis['rsi'] < 30 else "SELL" if analysis['rsi'] > 70 else "HOLD"
+                macd_sig = "BUY" if (analysis['macd'] > analysis['macd_signal']) else "SELL"
+                
+                signals = [rsi_sig, macd_sig]
+                buy_count = signals.count("BUY")
+                sell_count = signals.count("SELL")
+                
+                if buy_count > sell_count:
+                    st.success("🟢 **BULLISH** - Consider Long Position")
+                elif sell_count > buy_count:
+                    st.error("🔴 **BEARISH** - Consider Short Position")
+                else:
+                    st.warning("🟡 **NEUTRAL** - Wait for Confirmation")
+                
+                st.caption(f"RSI: {rsi_sig} | MACD: {macd_sig}")
+            
+            with signal_col2:
+                st.subheader("🎯 Long-term (Investors)")
+                sma_sig = "BUY" if analysis['current_price'] > analysis['sma200'] else "SELL"
+                trend_sig = "BUY" if "Bullish" in analysis['ma_cross_status'] else "SELL"
+                
+                signals_lt = [sma_sig, trend_sig]
+                buy_count_lt = signals_lt.count("BUY")
+                sell_count_lt = signals_lt.count("SELL")
+                
+                if buy_count_lt > sell_count_lt:
+                    st.success("🟢 **ACCUMULATE** - Long-term Uptrend")
+                elif sell_count_lt > buy_count_lt:
+                    st.error("🔴 **REDUCE** - Long-term Downtrend")
+                else:
+                    st.warning("🟡 **HOLD** - Consolidation Phase")
+                
+                st.caption(f"SMA200: {sma_sig} | Trend: {trend_sig}")
+            
+            st.markdown("---")
+            
+            # ========== DISCLAIMER ==========
+            st.info("⚠️ **DISCLAIMER**: This analysis is for educational purposes only. Not financial advice. Always conduct your own research and consult a financial advisor before trading.")
+            
+            st.success("✅ Analysis Complete - All systems operational")
 
 else:
-    st.info("👈 Enter a ticker in the sidebar to begin analysis")
+    st.info("👈 Enter a ticker symbol and click Analyze to begin comprehensive technical analysis")
